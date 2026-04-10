@@ -4,7 +4,7 @@ An advanced, from-scratch implementation of an LLM agent orchestrator in n8n. Th
 
 ## 🏗️ Architecture & Visual Flow
 
-![Workflow Diagram](./Screenshot.jpg)
+![Workflow Diagram](./Screenshot2.png)
 
 This workflow operates as an API endpoint, receiving user messages and responding dynamically based on whether the LLM needs to use external tools to formulate its answer.
 
