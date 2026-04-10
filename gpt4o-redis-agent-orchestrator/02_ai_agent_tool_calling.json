@@ -1,0 +1,181 @@
+{
+  "name": "AI Agent – Tool-Calling with Persistent Memory",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "agent/chat",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-agent",
+      "name": "Webhook – Agent Chat",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 400],
+      "notes": "Entry point. Expects { session_id, message, user_id } in the body."
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=memory_{{ $json.body.session_id }}",
+        "options": {}
+      },
+      "id": "redis-load-memory",
+      "name": "Redis – Load Conversation Memory",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [420, 400],
+      "notes": "Loads the last N turns of conversation history from Redis using session_id as key."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reconstruct conversation history from Redis\nconst redisData = $input.first().json;\nconst body = $('Webhook – Agent Chat').item.json.body;\nconst userMessage = body.message;\nconst sessionId = body.session_id;\nconst userId = body.user_id || 'anonymous';\n\n// Parse stored memory or start fresh\nlet history = [];\ntry {\n  history = JSON.parse(redisData.value || '[]');\n} catch (e) {\n  history = [];\n}\n\n// Keep last 10 turns (20 messages) to stay within context window\nif (history.length > 20) history = history.slice(-20);\n\n// Build messages array for LLM\nconst messages = [\n  {\n    role: 'system',\n    content: `You are a helpful AI assistant with access to tools. Today is ${new Date().toDateString()}. You can search the web, run calculations, look up weather, and query databases. Always think step-by-step and explain which tools you are using and why. Session: ${sessionId}`\n  },\n  ...history,\n  { role: 'user', content: userMessage }\n];\n\nreturn [{ json: { messages, history, userMessage, sessionId, userId } }];"
+      },
+      "id": "code-build-messages",
+      "name": "Code – Build Message History",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 400],
+      "notes": "Parses memory from Redis, trims to last 10 turns, and builds the full messages array including system prompt."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o\",\n  \"temperature\": 0.3,\n  \"messages\": {{ $json.messages }},\n  \"tools\": [\n    {\n      \"type\": \"function\",\n      \"function\": {\n        \"name\": \"web_search\",\n        \"description\": \"Search the internet for current information, news, or facts.\",\n        \"parameters\": {\n          \"type\": \"object\",\n          \"properties\": {\n            \"query\": { \"type\": \"string\", \"description\": \"The search query\" },\n            \"num_results\": { \"type\": \"integer\", \"description\": \"Number of results to return (1-10)\", \"default\": 5 }\n          },\n          \"required\": [\"query\"]\n        }\n      }\n    },\n    {\n      \"type\": \"function\",\n      \"function\": {\n        \"name\": \"get_weather\",\n        \"description\": \"Get current weather for any city.\",\n        \"parameters\": {\n          \"type\": \"object\",\n          \"properties\": {\n            \"city\": { \"type\": \"string\", \"description\": \"City name\" },\n            \"country_code\": { \"type\": \"string\", \"description\": \"ISO country code, e.g. US, GB, AE\" }\n          },\n          \"required\": [\"city\"]\n        }\n      }\n    },\n    {\n      \"type\": \"function\",\n      \"function\": {\n        \"name\": \"calculate\",\n        \"description\": \"Evaluate a mathematical expression safely.\",\n        \"parameters\": {\n          \"type\": \"object\",\n          \"properties\": {\n            \"expression\": { \"type\": \"string\", \"description\": \"Math expression, e.g. '(120 * 0.15) + 50'\" }\n          },\n          \"required\": [\"expression\"]\n        }\n      }\n    },\n    {\n      \"type\": \"function\",\n      \"function\": {\n        \"name\": \"query_database\",\n        \"description\": \"Run a read-only SQL query against the internal database.\",\n        \"parameters\": {\n          \"type\": \"object\",\n          \"properties\": {\n            \"sql\": { \"type\": \"string\", \"description\": \"SQL SELECT query\" },\n            \"description\": { \"type\": \"string\", \"description\": \"What this query is for\" }\n          },\n          \"required\": [\"sql\", \"description\"]\n        }\n      }\n    }\n  ],\n  \"tool_choice\": \"auto\"\n}",
+        "options": {}
+      },
+      "id": "http-agent-llm",
+      "name": "HTTP – GPT-4o Agent Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [860, 400],
+      "notes": "GPT-4o with 4 tools: web_search, get_weather, calculate, query_database. Returns tool_call or direct answer."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Detect if the model wants to call a tool\nconst response = $input.first().json;\nconst choice = response.choices[0];\nconst finishReason = choice.finish_reason;\nconst toolCalls = choice.message.tool_calls || [];\n\nif (finishReason === 'tool_calls' && toolCalls.length > 0) {\n  return [{ json: { needs_tool: true, tool_calls: toolCalls, agent_message: choice.message } }];\n} else {\n  return [{ json: { needs_tool: false, final_answer: choice.message.content, agent_message: choice.message } }];\n}"
+      },
+      "id": "code-route",
+      "name": "Code – Route: Tool Call or Answer?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 400],
+      "notes": "Routes workflow based on finish_reason: 'tool_calls' -> execute tools, 'stop' -> return final answer."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [
+            {
+              "id": "needs-tool",
+              "leftValue": "={{ $json.needs_tool }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-tool-needed",
+      "name": "IF – Tool Needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1300, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Tool dispatcher: execute the appropriate tool based on tool name\nconst toolCalls = $input.first().json.tool_calls;\nconst results = [];\n\nfor (const tc of toolCalls) {\n  const args = JSON.parse(tc.function.arguments);\n  let result = '';\n\n  if (tc.function.name === 'calculate') {\n    // Safe math evaluation\n    try {\n      const safeExpr = args.expression.replace(/[^0-9+\\-*/().% ]/g, '');\n      result = String(eval(safeExpr));\n    } catch (e) {\n      result = `Error evaluating expression: ${e.message}`;\n    }\n  } else if (tc.function.name === 'get_weather') {\n    // Stubbed – replace with real OpenWeatherMap call in production\n    result = JSON.stringify({\n      city: args.city,\n      country: args.country_code || 'unknown',\n      temp_c: 28,\n      condition: 'Partly cloudy',\n      humidity: '62%',\n      note: 'Replace with real OpenWeatherMap API call'\n    });\n  } else if (tc.function.name === 'web_search') {\n    // Stubbed – replace with SerpAPI or Brave Search in production\n    result = JSON.stringify({\n      query: args.query,\n      results: [\n        { title: 'Search result 1', snippet: 'Replace with real search API results.', url: 'https://example.com' }\n      ],\n      note: 'Integrate SerpAPI or Brave Search for live results'\n    });\n  } else if (tc.function.name === 'query_database') {\n    // Stubbed – replace with n8n Postgres/MySQL node in production\n    result = JSON.stringify({\n      sql: args.sql,\n      description: args.description,\n      rows: [],\n      note: 'Connect a Postgres or MySQL node for real DB queries'\n    });\n  } else {\n    result = `Unknown tool: ${tc.function.name}`;\n  }\n\n  results.push({ tool_call_id: tc.id, name: tc.function.name, result });\n}\n\nreturn [{ json: { tool_results: results } }];"
+      },
+      "id": "code-tool-dispatch",
+      "name": "Code – Tool Dispatcher",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1520, 280],
+      "notes": "Executes the requested tool. calculate is live; web_search, weather, db are stubbed with clear integration notes."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o\",\n  \"temperature\": 0.3,\n  \"messages\": [\n    ...{{ $('Code – Build Message History').item.json.messages }},\n    {{ $('Code – Route: Tool Call or Answer?').item.json.agent_message }},\n    ...{{ $json.tool_results.map(r => ({ role: 'tool', tool_call_id: r.tool_call_id, name: r.name, content: r.result })) }}\n  ]\n}",
+        "options": {}
+      },
+      "id": "http-agent-resume",
+      "name": "HTTP – GPT-4o Resume with Tool Results",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1740, 280],
+      "notes": "Sends tool results back to GPT-4o so it can synthesize the final answer using real data."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Collect final answer from either path (direct or after tool use)\nconst directPath = $('Code – Route: Tool Call or Answer?').item;\nconst toolPath = $('HTTP – GPT-4o Resume with Tool Results').item;\n\nlet finalAnswer = '';\nif (toolPath) {\n  finalAnswer = toolPath.json.choices[0].message.content;\n} else {\n  finalAnswer = directPath.json.final_answer;\n}\n\nconst history = $('Code – Build Message History').item.json.history;\nconst userMessage = $('Code – Build Message History').item.json.userMessage;\nconst sessionId = $('Code – Build Message History').item.json.sessionId;\n\n// Append this turn to history\nconst updatedHistory = [\n  ...history,\n  { role: 'user', content: userMessage },\n  { role: 'assistant', content: finalAnswer }\n];\n\n// Keep only last 20 messages\nconst trimmed = updatedHistory.slice(-20);\n\nreturn [{ json: { finalAnswer, sessionId, updatedHistory: trimmed, userMessage } }];"
+      },
+      "id": "code-collect-answer",
+      "name": "Code – Collect Final Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1520, 520],
+      "notes": "Merges both code paths (tool vs direct) and assembles updated history for persistence."
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=memory_{{ $json.sessionId }}",
+        "value": "={{ JSON.stringify($json.updatedHistory) }}",
+        "expire": true,
+        "ttl": 86400,
+        "options": {}
+      },
+      "id": "redis-save-memory",
+      "name": "Redis – Save Updated Memory",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1740, 520],
+      "notes": "Persists updated conversation history to Redis with 24h TTL. Enables multi-turn conversations."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"session_id\": \"{{ $json.sessionId }}\",\n  \"answer\": \"{{ $json.finalAnswer }}\",\n  \"turns\": {{ Math.floor($json.updatedHistory.length / 2) }},\n  \"timestamp\": \"{{ new Date().toISOString() }}\"\n}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "respond-agent",
+      "name": "Respond – Agent Answer",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1960, 520]
+    }
+  ],
+  "connections": {
+    "Webhook – Agent Chat": { "main": [[{ "node": "Redis – Load Conversation Memory", "type": "main", "index": 0 }]] },
+    "Redis – Load Conversation Memory": { "main": [[{ "node": "Code – Build Message History", "type": "main", "index": 0 }]] },
+    "Code – Build Message History": { "main": [[{ "node": "HTTP – GPT-4o Agent Call", "type": "main", "index": 0 }]] },
+    "HTTP – GPT-4o Agent Call": { "main": [[{ "node": "Code – Route: Tool Call or Answer?", "type": "main", "index": 0 }]] },
+    "Code – Route: Tool Call or Answer?": { "main": [[{ "node": "IF – Tool Needed?", "type": "main", "index": 0 }]] },
+    "IF – Tool Needed?": {
+      "main": [
+        [{ "node": "Code – Tool Dispatcher", "type": "main", "index": 0 }],
+        [{ "node": "Code – Collect Final Answer", "type": "main", "index": 0 }]
+      ]
+    },
+    "Code – Tool Dispatcher": { "main": [[{ "node": "HTTP – GPT-4o Resume with Tool Results", "type": "main", "index": 0 }]] },
+    "HTTP – GPT-4o Resume with Tool Results": { "main": [[{ "node": "Code – Collect Final Answer", "type": "main", "index": 0 }]] },
+    "Code – Collect Final Answer": { "main": [[{ "node": "Redis – Save Updated Memory", "type": "main", "index": 0 }]] },
+    "Redis – Save Updated Memory": { "main": [[{ "node": "Respond – Agent Answer", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true },
+  "tags": ["AI Agent", "Tool Calling", "Memory", "GPT-4o", "Redis"],
+  "meta": { "templateCredsSetupCompleted": false }
+}
