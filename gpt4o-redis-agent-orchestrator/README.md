@@ -2,7 +2,9 @@
 
 An advanced, from-scratch implementation of an LLM agent orchestrator in n8n. This workflow manually handles OpenAI's tool-calling loop and maintains persistent multi-turn conversation memory using Redis.
 
-## 🏗️ Architecture
+## 🏗️ Architecture & Visual Flow
+
+![Workflow Diagram](./Screenshot.jpg)
 
 This workflow operates as an API endpoint, receiving user messages and responding dynamically based on whether the LLM needs to use external tools to formulate its answer.
 
