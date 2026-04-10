@@ -1,0 +1,132 @@
+{
+  "name": "Scheduled Data Pipeline – ETL, Anomaly Detection & Alerting",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "hours", "minutesInterval": 6 }] }
+      },
+      "id": "cron-trigger",
+      "name": "Schedule – Every 6 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [200, 400],
+      "notes": "Runs every 6 hours. Can be changed to any interval via the cron expression."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  DATE_TRUNC('hour', created_at) as hour,\n  COUNT(*) as order_count,\n  SUM(amount) as revenue,\n  AVG(amount) as avg_order_value,\n  COUNT(DISTINCT user_id) as unique_customers,\n  COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_orders\nFROM orders\nWHERE created_at >= NOW() - INTERVAL '7 days'\nGROUP BY DATE_TRUNC('hour', created_at)\nORDER BY hour DESC;",
+        "options": {}
+      },
+      "id": "postgres-fetch",
+      "name": "Postgres – Fetch Last 7 Days Orders",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [420, 400],
+      "notes": "Aggregates hourly order metrics over the past 7 days. Replace with your actual DB schema."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Statistical anomaly detection using Z-score method\nconst rows = $input.all().map(i => i.json);\n\nif (rows.length < 24) {\n  return [{ json: { anomalies: [], metrics: rows, insufficient_data: true } }];\n}\n\nfunction stats(arr) {\n  const mean = arr.reduce((a, b) => a + b, 0) / arr.length;\n  const variance = arr.reduce((sum, x) => sum + Math.pow(x - mean, 2), 0) / arr.length;\n  return { mean, std: Math.sqrt(variance) };\n}\n\nconst revenues = rows.map(r => parseFloat(r.revenue));\nconst orderCounts = rows.map(r => parseInt(r.order_count));\nconst failRates = rows.map(r => parseInt(r.failed_orders) / Math.max(parseInt(r.order_count), 1));\n\nconst revStats = stats(revenues);\nconst countStats = stats(orderCounts);\nconst failStats = stats(failRates);\n\nconst anomalies = [];\nconst Z_THRESHOLD = 2.5; // Flag if > 2.5 standard deviations from mean\n\nfor (const row of rows.slice(0, 6)) { // Check last 6 hours\n  const revZ = Math.abs((parseFloat(row.revenue) - revStats.mean) / (revStats.std || 1));\n  const countZ = Math.abs((parseInt(row.order_count) - countStats.mean) / (countStats.std || 1));\n  const failRate = parseInt(row.failed_orders) / Math.max(parseInt(row.order_count), 1);\n  const failZ = Math.abs((failRate - failStats.mean) / (failStats.std || 1));\n\n  if (revZ > Z_THRESHOLD) {\n    anomalies.push({\n      type: 'revenue_anomaly',\n      hour: row.hour,\n      value: row.revenue,\n      expected: revStats.mean.toFixed(2),\n      z_score: revZ.toFixed(2),\n      severity: revZ > 4 ? 'critical' : 'warning',\n      direction: parseFloat(row.revenue) > revStats.mean ? 'spike' : 'drop'\n    });\n  }\n\n  if (failRate > 0.1 || failZ > Z_THRESHOLD) {\n    anomalies.push({\n      type: 'high_failure_rate',\n      hour: row.hour,\n      failed: row.failed_orders,\n      total: row.order_count,\n      rate: (failRate * 100).toFixed(1) + '%',\n      severity: failRate > 0.2 ? 'critical' : 'warning'\n    });\n  }\n}\n\nconst summary = {\n  period: '7 days',\n  total_revenue: revenues.reduce((a, b) => a + b, 0).toFixed(2),\n  avg_hourly_revenue: revStats.mean.toFixed(2),\n  avg_hourly_orders: countStats.mean.toFixed(1),\n  anomaly_count: anomalies.length,\n  anomalies\n};\n\nreturn [{ json: summary }];"
+      },
+      "id": "code-anomaly",
+      "name": "Code – Z-Score Anomaly Detection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 400],
+      "notes": "Uses Z-score method (threshold=2.5σ) to detect revenue spikes, drops, and unusually high failure rates."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "conditions": [
+            {
+              "id": "has-anomalies",
+              "leftValue": "={{ $json.anomaly_count }}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-anomalies",
+      "name": "IF – Anomalies Detected?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [860, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o-mini\",\n  \"temperature\": 0.1,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a business analyst. Given anomaly data, provide a brief diagnostic report with: (1) what happened, (2) likely causes, (3) recommended next steps. Be concise — max 150 words.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Anomalies detected:\\n{{ JSON.stringify($json.anomalies, null, 2) }}\\n\\nSummary: {{ $json.total_revenue }} total revenue, {{ $json.avg_hourly_orders }} avg orders/hour.\"\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "http-diagnose",
+      "name": "HTTP – LLM Diagnose Anomalies",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1080, 280],
+      "notes": "Generates a natural-language diagnosis of detected anomalies for the Slack alert."
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "channel": "=#data-alerts",
+        "text": "=:warning: *Data Anomaly Alert* — {{ new Date().toUTCString() }}\n\n{{ $('HTTP – LLM Diagnose Anomalies').item.json.choices[0].message.content }}\n\n*Detected Anomalies ({{ $('Code – Z-Score Anomaly Detection').item.json.anomaly_count }}):*\n{{ $('Code – Z-Score Anomaly Detection').item.json.anomalies.map(a => `• ${a.type.replace(/_/g,' ')} | ${a.hour} | ${a.severity.toUpperCase()}`).join('\\n') }}\n\n*7-Day Stats:* Total Revenue: ${{ $('Code – Z-Score Anomaly Detection').item.json.total_revenue }} | Avg Orders/hr: {{ $('Code – Z-Score Anomaly Detection').item.json.avg_hourly_orders }}",
+        "otherOptions": { "mrkdwn": true }
+      },
+      "id": "slack-anomaly-alert",
+      "name": "Slack – Anomaly Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1300, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Transform data for BI/dashboard upsert\nconst summary = $('Code – Z-Score Anomaly Detection').item.json;\nconst pipeline_run_id = `RUN_${Date.now()}`;\n\nreturn [{ json: {\n  pipeline_run_id,\n  ran_at: new Date().toISOString(),\n  anomaly_count: summary.anomaly_count,\n  total_revenue: summary.total_revenue,\n  avg_hourly_revenue: summary.avg_hourly_revenue,\n  avg_hourly_orders: summary.avg_hourly_orders,\n  anomalies_json: JSON.stringify(summary.anomalies),\n  status: 'completed'\n} }];"
+      },
+      "id": "code-prepare-log",
+      "name": "Code – Prepare Pipeline Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 540]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO pipeline_runs (pipeline_run_id, ran_at, anomaly_count, total_revenue, avg_hourly_revenue, avg_hourly_orders, anomalies_json, status)\nVALUES ('{{ $json.pipeline_run_id }}', '{{ $json.ran_at }}', {{ $json.anomaly_count }}, {{ $json.total_revenue }}, {{ $json.avg_hourly_revenue }}, {{ $json.avg_hourly_orders }}, '{{ $json.anomalies_json }}'::jsonb, '{{ $json.status }}');",
+        "options": {}
+      },
+      "id": "postgres-log-run",
+      "name": "Postgres – Log Pipeline Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1300, 540],
+      "notes": "Records every pipeline execution for observability, trend analysis, and audit trails."
+    }
+  ],
+  "connections": {
+    "Schedule – Every 6 Hours": { "main": [[{ "node": "Postgres – Fetch Last 7 Days Orders", "type": "main", "index": 0 }]] },
+    "Postgres – Fetch Last 7 Days Orders": { "main": [[{ "node": "Code – Z-Score Anomaly Detection", "type": "main", "index": 0 }]] },
+    "Code – Z-Score Anomaly Detection": { "main": [[{ "node": "IF – Anomalies Detected?", "type": "main", "index": 0 }]] },
+    "IF – Anomalies Detected?": {
+      "main": [
+        [{ "node": "HTTP – LLM Diagnose Anomalies", "type": "main", "index": 0 }],
+        [{ "node": "Code – Prepare Pipeline Log", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP – LLM Diagnose Anomalies": { "main": [[{ "node": "Slack – Anomaly Alert", "type": "main", "index": 0 }]] },
+    "Slack – Anomaly Alert": { "main": [[{ "node": "Code – Prepare Pipeline Log", "type": "main", "index": 0 }]] },
+    "Code – Prepare Pipeline Log": { "main": [[{ "node": "Postgres – Log Pipeline Run", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true },
+  "tags": ["Data Pipeline", "ETL", "Anomaly Detection", "Analytics", "Scheduled"],
+  "meta": { "templateCredsSetupCompleted": false }
+}
