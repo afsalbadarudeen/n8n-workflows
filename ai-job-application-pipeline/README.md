@@ -4,7 +4,7 @@ An automated, end-to-end workflow built in n8n that scrapes job listings, evalua
 
 ## 🏗️ Architecture & Visual Flow
 
-![Workflow Diagram](./image.png)
+![Workflow Diagram](./Screenshot1.jpg)
 
 ## 🎯 Objective
 To streamline the job search process by eliminating manual screening and generic applications. This pipeline autonomously identifies relevant opportunities, scores them against my specific background, and drafts highly personalized cover letters and recruiter messages.
